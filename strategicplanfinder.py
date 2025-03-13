@@ -49,22 +49,25 @@ def main():
     st.write(
         "This app uses a custom Google search engine (configured to search community college websites) "
         "to look for the term 'strategic plan.' For each result, it extracts the URL, a text snippet referencing the plan, "
-        "a years range (e.g., 2025-2030), and then performs a secondary search on the website to find enrollment numbers."
+        "a years range (e.g., 2025-2030), and then performs a secondary search on the website to find enrollment numbers. "
+        "Only results from .edu domains are considered."
     )
 
-    # Main search for "strategic plan"
-    search_query = "strategic plan"
-    st.info("Searching for strategic plan references...")
+    # Optionally, you could include site:.edu in the search query
+    search_query = "strategic plan site:.edu"
+    st.info("Searching for strategic plan references on .edu websites...")
     search_results = google_search(search_query)
     
     results_data = []
     if "items" in search_results:
         for item in search_results["items"]:
             url = item.get("link", "")
+            # Check if the URL is from a .edu domain
+            domain = urlparse(url).netloc
+            if not domain.endswith(".edu"):
+                continue  # Skip if not a .edu domain
             snippet = item.get("snippet", "")
             years_range = extract_years(snippet)
-            # Extract the domain from the URL to perform the enrollment search
-            domain = urlparse(url).netloc
             enrollment = search_enrollment(domain)
             results_data.append({
                 "URL": url,
