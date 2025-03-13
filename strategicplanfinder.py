@@ -1,10 +1,28 @@
-import streamlit as st
-import requests
 import re
+import time
+import requests
 import pandas as pd
-from urllib.parse import urlparse
 
-# 1. Put your list of exact URLs here:
+from urllib.parse import urljoin, urlparse
+from collections import deque
+from bs4 import BeautifulSoup
+
+################################################################################
+# CONFIGURABLE PARAMETERS
+################################################################################
+
+MAX_DEPTH = 1               # How many link-levels to traverse from the starting URL
+MAX_PAGES_PER_SITE = 50     # Maximum pages to crawl per domain
+TIMEOUT = 10                # Seconds to wait for each HTTP request
+SLEEP_BETWEEN_REQUESTS = 1.0  # Pause (in seconds) between requests to be polite
+USER_AGENT = "StrategicPlanScraper/1.0 (+https://example.com/bot)"
+
+KEYWORD = "strategic plan"
+
+################################################################################
+# COMPLETE LIST OF COMMUNITY COLLEGE URLs
+################################################################################
+
 COMMUNITY_COLLEGE_URLS = [
     "https://www.atc.edu/",
     "www.alamancecc.edu/",
@@ -827,8 +845,8 @@ COMMUNITY_COLLEGE_URLS = [
     "uaptc.edu/",
     "www.gallup.unm.edu/",
     "losalamos.unm.edu/",
-    "dacc.nmsu.edu/",
-    "grants.nmsu.edu/",
+    "taos.unm.edu/",
+    "valencia.unm.edu/",
     "www.titusville.pitt.edu/home",
     "www.sc.edu/about/system_and_campuses/lancaster/index.php",
     "sc.edu/about/system_and_campuses/salkehatchie/index.php",
@@ -867,7 +885,7 @@ COMMUNITY_COLLEGE_URLS = [
     "www.wilsontech.org/",
     "https://www.westerntc.edu/",
     "www.wtc.edu/",
-    "https://www.westmoreland.edu/",
+    "https://westmoreland.edu/",
     "https://www.wcjc.edu/",
     "www.wmcc.edu/",
     "www.wsutech.edu/",
@@ -888,112 +906,168 @@ COMMUNITY_COLLEGE_URLS = [
     "https://yc.yccd.edu/"
 ]
 
+################################################################################
+# HELPER FUNCTIONS
+################################################################################
 
-# 2. Helper function: Perform a Google Custom Search API request
-def google_search(query):
+def get_robots_txt_disallows(base_url):
     """
-    Returns the JSON response from the Custom Search API or an empty dict if error.
+    Fetch /robots.txt from the domain and return a list of disallowed paths.
+    We'll do a simple string match approach. For a more robust solution, consider
+    using a dedicated library like 'robotexclusionrulesparser'.
     """
-    api_key = st.secrets["GOOGLE_API_KEY"]
-    cse_id = st.secrets["GOOGLE_CSE_ID"]
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": api_key,
-        "cx": cse_id,
-        "q": query,
-    }
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        st.error(f"Google API error: {response.status_code}")
-        return {}
+    parsed = urlparse(base_url if base_url.startswith("http") else "http://" + base_url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    disallowed_paths = []
+    try:
+        resp = requests.get(robots_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        if resp.status_code == 200:
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if line.lower().startswith("disallow:"):
+                    # e.g. "Disallow: /private/"
+                    path = line.split(":", 1)[1].strip()
+                    disallowed_paths.append(path)
+    except requests.RequestException:
+        pass
+    return disallowed_paths
 
-# 3. Helper function: Extract a years range (e.g. "2025-2030") from a text snippet
-def extract_years(text):
+def is_allowed_by_robots(disallowed_paths, url_path):
     """
-    Look for a pattern like 2025-2030 or 2025 - 2030
+    Check if a given URL path is disallowed by robots.txt lines.
+    We'll do a simple "starts with" check.
+    """
+    for d in disallowed_paths:
+        if url_path.startswith(d):
+            return False
+    return True
+
+def same_domain(url1, url2):
+    """
+    Return True if url2 is on the same domain (host) as url1.
+    """
+    return urlparse(url1).netloc == urlparse(url2).netloc
+
+def extract_snippet(text, keyword, snippet_size=150):
+    """
+    Return a snippet of around 'snippet_size' characters centered on the first
+    occurrence of 'keyword' (case-insensitive).
+    """
+    text_lower = text.lower()
+    keyword_lower = keyword.lower()
+    idx = text_lower.find(keyword_lower)
+    if idx == -1:
+        return ""
+    start = max(0, idx - snippet_size // 2)
+    end = min(len(text), idx + snippet_size // 2)
+    snippet = text[start:end].strip()
+    return snippet
+
+def extract_year_range(text):
+    """
+    Look for a pattern like "2025-2030" or "2025 - 2030" in the text.
+    Returns the first match found, or empty string if none.
     """
     pattern = r"\b(20\d{2}\s*-\s*20\d{2})\b"
-    matches = re.findall(pattern, text)
-    return matches[0] if matches else ""
-
-# 4. Helper function: Attempt to find an enrollment number from a snippet
-def extract_enrollment(snippet):
-    """
-    Attempt to match a large integer or an integer with commas, e.g. 15,000 or 15000.
-    """
-    match = re.search(r"(\d{1,3}(,\d{3})+|\d{4,})", snippet)
+    match = re.search(pattern, text)
     return match.group(1) if match else ""
 
-def search_enrollment(domain):
+################################################################################
+# MAIN CRAWLER LOGIC
+################################################################################
+
+def shallow_crawl_for_keyword(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_PAGES_PER_SITE):
     """
-    Query the domain for 'enrollment' and return the first matched number from the snippet.
+    Perform a shallow BFS crawl starting from 'start_url'.
+    Return a list of dicts with keys: 'url', 'snippet', 'year_range'.
     """
-    enrollment_query = f'site:{domain} enrollment'
-    search_results = google_search(enrollment_query)
-    if "items" not in search_results:
-        return ""
-    for item in search_results["items"]:
-        snippet = item.get("snippet", "")
-        found = extract_enrollment(snippet)
-        if found:
-            return found
-    return ""
+    results = []
+    visited = set()
+    queue = deque([(start_url, 0)])
+    
+    # Normalize the start_url
+    if not start_url.startswith("http"):
+        start_url = "http://" + start_url
+
+    # Get disallowed paths from robots.txt
+    disallowed_paths = get_robots_txt_disallows(start_url)
+
+    pages_crawled = 0
+
+    while queue:
+        current_url, depth = queue.popleft()
+        if current_url in visited or depth > max_depth:
+            continue
+
+        visited.add(current_url)
+        pages_crawled += 1
+        if pages_crawled > max_pages:
+            break  # Avoid crawling too many pages on one domain
+
+        # Check robots.txt
+        parsed_current = urlparse(current_url)
+        url_path = parsed_current.path or "/"
+        if not is_allowed_by_robots(disallowed_paths, url_path):
+            continue
+
+        # Fetch the page
+        try:
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            resp = requests.get(current_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+            if resp.status_code != 200:
+                continue
+
+            # Only parse if it's HTML
+            content_type = resp.headers.get("Content-Type", "")
+            if "text/html" not in content_type.lower():
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            text = soup.get_text(separator=" ", strip=True)
+
+            # Check if keyword is in the page text
+            if keyword.lower() in text.lower():
+                snippet = extract_snippet(text, keyword)
+                year_range = extract_year_range(snippet or text)
+                results.append({
+                    "url": current_url,
+                    "snippet": snippet,
+                    "year_range": year_range
+                })
+
+            # BFS: gather links if within depth
+            if depth < max_depth:
+                for link in soup.find_all("a", href=True):
+                    href = link["href"]
+                    next_url = urljoin(current_url, href)
+                    # Only follow links on the same domain
+                    if same_domain(start_url, next_url) and next_url not in visited:
+                        queue.append((next_url, depth + 1))
+
+        except requests.RequestException:
+            # Handle timeouts, connection issues, etc.
+            continue
+
+    return results
 
 def main():
-    st.title("Community College Strategic Plan Search")
-    st.write(
-        "This app runs a Google Custom Search query against a fixed list of community-college URLs. "
-        "It looks for the phrase **'strategic plan'**, extracts any referenced **years** (e.g. 2025-2030), "
-        "and attempts to find **enrollment** numbers from the same domain."
-    )
+    all_results = []
 
-    if st.button("Run Search"):
-        results_data = []
-        
-        # Because the list is long, you might want to limit for testing:
-        # for college_url in COMMUNITY_COLLEGE_URLS[:10]:
-        for college_url in COMMUNITY_COLLEGE_URLS:
-            # Parse out the domain
-            parsed = urlparse(college_url if college_url.startswith("http") else "http://" + college_url)
-            domain = parsed.netloc.lower()
-            if not domain:
-                # If the URL is malformed, skip
-                continue
-            
-            # Primary query to find "strategic plan"
-            plan_query = f'site:{domain} "strategic plan"'
-            plan_results = google_search(plan_query)
+    for college_url in COMMUNITY_COLLEGE_URLS:
+        print(f"\n=== Crawling {college_url} ===")
+        site_results = shallow_crawl_for_keyword(college_url)
+        print(f"Found {len(site_results)} pages referencing '{KEYWORD}' at {college_url}")
+        all_results.extend(site_results)
 
-            snippet_text = ""
-            years_range = ""
-            if "items" in plan_results:
-                # Just take the first item for demonstration
-                first_item = plan_results["items"][0]
-                snippet_text = first_item.get("snippet", "")
-                # Attempt to extract a years range
-                years_range = extract_years(snippet_text)
-            
-            # Secondary query to find enrollment
-            enrollment_size = ""
-            if snippet_text:
-                enrollment_size = search_enrollment(domain)
-
-            results_data.append({
-                "URL": college_url,
-                "Enrollment Size": enrollment_size,
-                "Strategic Plan Text": snippet_text,
-                "Years Referenced": years_range,
-            })
-        
-        # Create a DataFrame
-        df = pd.DataFrame(results_data)
-        st.subheader("Search Results")
-        st.dataframe(df)
-
+    # Convert to DataFrame
+    df = pd.DataFrame(all_results)
+    if not df.empty:
+        print("\nSummary of All Findings (first 10 rows):")
+        print(df.head(10))
+        df.to_csv("strategic_plan_results.csv", index=False)
+        print("\nResults saved to strategic_plan_results.csv")
     else:
-        st.info("Click the 'Run Search' button to begin.")
+        print("\nNo results found for any site.")
 
 if __name__ == "__main__":
     main()
