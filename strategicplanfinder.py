@@ -1,11 +1,12 @@
-import re
-import time
+import streamlit as st
 import requests
+import re
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import concurrent.futures
+import time
 
 ################################################################################
 # CONFIGURATION
@@ -18,7 +19,7 @@ MAX_DEPTH = 1
 MAX_PAGES_PER_SITE = 20
 
 # Concurrency: how many domains to crawl in parallel
-MAX_WORKERS = 10
+MAX_WORKERS = 5
 
 # Timeouts and delays
 CONNECT_TIMEOUT = 5
@@ -33,12 +34,11 @@ KEYWORD = "strategic plan"
 
 # Additional link text/URL keywords that suggest relevant pages
 RELEVANT_LINK_KEYWORDS = [
-    "strategic", "plan", "planning", "mission", 
+    "strategic", "plan", "planning", "mission",
     "effectiveness", "research", "accreditation", "vision"
 ]
 
-# Full list of college URLs. This is just a small sample; 
-# in production, paste your entire list of community-college URLs here.
+# SAMPLE LIST: In production, paste your full list of 1,000+ URLs here
 COMMUNITY_COLLEGE_URLS = [
     "https://www.atc.edu/",
     "www.alamancecc.edu/",
@@ -959,28 +959,20 @@ def extract_year_range(text):
     return match.group(1) if match else ""
 
 def same_domain(url1, url2):
-    """
-    Return True if url2 is on the same domain (host) as url1.
-    """
+    """Return True if url2 is on the same domain (host) as url1."""
     return urlparse(url1).netloc.lower() == urlparse(url2).netloc.lower()
 
 def normalize_url(url):
     """
-    Normalize URLs by forcing scheme (http), removing fragments, queries, trailing slash, etc.
+    Normalize URLs by forcing scheme, removing fragments, queries, trailing slash, etc.
     """
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
     parsed = urlparse(url)
-    # remove query and fragment, unify netloc to lowercase
     normalized = parsed._replace(query="", fragment="", netloc=parsed.netloc.lower()).geturl()
-    # optionally remove trailing slash from path
     if normalized.endswith("/"):
         normalized = normalized[:-1]
     return normalized
-
-################################################################################
-# MAIN CRAWLER FUNCTION
-################################################################################
 
 def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_PAGES_PER_SITE):
     """
@@ -991,12 +983,10 @@ def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_
     results = []
     visited = set()
     queue = deque([(normalize_url(start_url), 0)])
-    
     pages_crawled = 0
 
     while queue:
         current_url, depth = queue.popleft()
-
         if current_url in visited or depth > max_depth:
             continue
         visited.add(current_url)
@@ -1009,7 +999,7 @@ def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             resp = requests.get(
-                current_url, 
+                current_url,
                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                 headers={"User-Agent": USER_AGENT}
             )
@@ -1033,7 +1023,7 @@ def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_
                     "year_range": year_range
                 })
 
-            # If we haven't reached max_depth, find relevant links
+            # BFS: gather relevant links if within depth
             if depth < max_depth:
                 for link in soup.find_all("a", href=True):
                     link_text = link.get_text(separator=" ", strip=True)
@@ -1044,41 +1034,73 @@ def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_
                         queue.append((next_url, depth + 1))
 
         except requests.RequestException:
-            # If we fail (timeout, etc.), skip
             continue
 
     return results
 
 ################################################################################
-# PARALLEL DRIVER
+# STREAMLIT APP
 ################################################################################
 
 def main():
-    all_results = []
+    st.title("Strategic Plan Scraper (Heuristic + Parallel)")
+    st.write("""
+    This app crawls a list of community-college homepages, 
+    looking for the phrase "strategic plan". 
+    It only follows links that contain certain keywords 
+    ("strategic", "plan", "mission", etc.) 
+    and goes 1 link deep.
+    """)
 
-    # We'll run each domain in parallel using a ThreadPoolExecutor
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_domain = {
-            executor.submit(crawl_domain, url): url
-            for url in COMMUNITY_COLLEGE_URLS
-        }
-        for future in concurrent.futures.as_completed(future_to_domain):
-            domain_url = future_to_domain[future]
-            try:
-                domain_results = future.result()
-                print(f"[INFO] {domain_url} => {len(domain_results)} matches")
-                all_results.extend(domain_results)
-            except Exception as e:
-                print(f"[ERROR] {domain_url} => {e}")
+    if st.button("Start Crawling"):
+        # We'll display partial results in a container
+        placeholder = st.empty()
 
-    # Convert to DataFrame and save
-    df = pd.DataFrame(all_results)
-    if not df.empty:
-        df.drop_duplicates(subset=["url"], inplace=True)
-        df.to_csv("strategic_plan_results.csv", index=False)
-        print(f"\n[INFO] Results saved to strategic_plan_results.csv ({len(df)} rows)")
+        # We'll store partial results in a list, 
+        # and once we have 10 new items, we display them
+        partial_results = []
+        total_count = 0
+
+        # We'll run each domain in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Kick off all domain crawls
+            future_to_domain = {
+                executor.submit(crawl_domain, url): url
+                for url in COMMUNITY_COLLEGE_URLS
+            }
+            # As each domain finishes, we get its results
+            for future in concurrent.futures.as_completed(future_to_domain):
+                domain_url = future_to_domain[future]
+                try:
+                    domain_results = future.result()
+                    # Add domain results to partial
+                    for r in domain_results:
+                        partial_results.append(r)
+                        total_count += 1
+                        # Once we have 10 new results, display them
+                        if len(partial_results) == 10:
+                            df = pd.DataFrame(partial_results)
+                            with placeholder.container():
+                                st.write(f"**Partial Results (Total so far: {total_count})**")
+                                st.table(df)
+                            partial_results.clear()
+
+                    # Show a small message that a domain finished
+                    st.write(f"**Done**: {domain_url} => {len(domain_results)} matches")
+
+                except Exception as e:
+                    st.write(f"[ERROR] {domain_url} => {e}")
+
+        # After concurrency finishes, if partial_results is not empty, show them
+        if partial_results:
+            df = pd.DataFrame(partial_results)
+            st.write(f"**Final Partial Results** (last batch, total so far: {total_count})")
+            st.table(df)
+
+        st.write("**Crawl Complete.**")
+
     else:
-        print("\n[INFO] No results found for any site.")
+        st.info("Click 'Start Crawling' to begin.")
 
 if __name__ == "__main__":
     main()
