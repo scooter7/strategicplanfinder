@@ -2,27 +2,43 @@ import re
 import time
 import requests
 import pandas as pd
-
+from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from collections import deque
-from bs4 import BeautifulSoup
+import concurrent.futures
 
 ################################################################################
-# CONFIGURABLE PARAMETERS
+# CONFIGURATION
 ################################################################################
 
-MAX_DEPTH = 1               # How many link-levels to traverse from the starting URL
-MAX_PAGES_PER_SITE = 50     # Maximum pages to crawl per domain
-TIMEOUT = 10                # Seconds to wait for each HTTP request
-SLEEP_BETWEEN_REQUESTS = 1.0  # Pause (in seconds) between requests to be polite
+# BFS depth for each domain (0 = only homepage, 1 = homepage + links from homepage)
+MAX_DEPTH = 1
+
+# Max pages to crawl per domain
+MAX_PAGES_PER_SITE = 20
+
+# Concurrency: how many domains to crawl in parallel
+MAX_WORKERS = 10
+
+# Timeouts and delays
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 10
+SLEEP_BETWEEN_REQUESTS = 0.5
+
+# User-Agent for polite crawling
 USER_AGENT = "StrategicPlanScraper/1.0 (+https://example.com/bot)"
 
+# The main keyword we are looking for
 KEYWORD = "strategic plan"
 
-################################################################################
-# COMPLETE LIST OF COMMUNITY COLLEGE URLs
-################################################################################
+# Additional link text/URL keywords that suggest relevant pages
+RELEVANT_LINK_KEYWORDS = [
+    "strategic", "plan", "planning", "mission", 
+    "effectiveness", "research", "accreditation", "vision"
+]
 
+# Full list of college URLs. This is just a small sample; 
+# in production, paste your entire list of community-college URLs here.
 COMMUNITY_COLLEGE_URLS = [
     "https://www.atc.edu/",
     "www.alamancecc.edu/",
@@ -910,43 +926,14 @@ COMMUNITY_COLLEGE_URLS = [
 # HELPER FUNCTIONS
 ################################################################################
 
-def get_robots_txt_disallows(base_url):
+def link_is_relevant(link_text, link_url):
     """
-    Fetch /robots.txt from the domain and return a list of disallowed paths.
-    We'll do a simple string match approach. For a more robust solution, consider
-    using a dedicated library like 'robotexclusionrulesparser'.
+    Return True if the link text or the URL contains any of our RELEVANT_LINK_KEYWORDS.
+    This heuristic drastically reduces the number of pages we visit.
     """
-    parsed = urlparse(base_url if base_url.startswith("http") else "http://" + base_url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    disallowed_paths = []
-    try:
-        resp = requests.get(robots_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
-        if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if line.lower().startswith("disallow:"):
-                    # e.g. "Disallow: /private/"
-                    path = line.split(":", 1)[1].strip()
-                    disallowed_paths.append(path)
-    except requests.RequestException:
-        pass
-    return disallowed_paths
-
-def is_allowed_by_robots(disallowed_paths, url_path):
-    """
-    Check if a given URL path is disallowed by robots.txt lines.
-    We'll do a simple "starts with" check.
-    """
-    for d in disallowed_paths:
-        if url_path.startswith(d):
-            return False
-    return True
-
-def same_domain(url1, url2):
-    """
-    Return True if url2 is on the same domain (host) as url1.
-    """
-    return urlparse(url1).netloc == urlparse(url2).netloc
+    text_lower = link_text.lower()
+    url_lower = link_url.lower()
+    return any(kw in text_lower or kw in url_lower for kw in RELEVANT_LINK_KEYWORDS)
 
 def extract_snippet(text, keyword, snippet_size=150):
     """
@@ -960,8 +947,7 @@ def extract_snippet(text, keyword, snippet_size=150):
         return ""
     start = max(0, idx - snippet_size // 2)
     end = min(len(text), idx + snippet_size // 2)
-    snippet = text[start:end].strip()
-    return snippet
+    return text[start:end].strip()
 
 def extract_year_range(text):
     """
@@ -972,60 +958,72 @@ def extract_year_range(text):
     match = re.search(pattern, text)
     return match.group(1) if match else ""
 
+def same_domain(url1, url2):
+    """
+    Return True if url2 is on the same domain (host) as url1.
+    """
+    return urlparse(url1).netloc.lower() == urlparse(url2).netloc.lower()
+
+def normalize_url(url):
+    """
+    Normalize URLs by forcing scheme (http), removing fragments, queries, trailing slash, etc.
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    parsed = urlparse(url)
+    # remove query and fragment, unify netloc to lowercase
+    normalized = parsed._replace(query="", fragment="", netloc=parsed.netloc.lower()).geturl()
+    # optionally remove trailing slash from path
+    if normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
+
 ################################################################################
-# MAIN CRAWLER LOGIC
+# MAIN CRAWLER FUNCTION
 ################################################################################
 
-def shallow_crawl_for_keyword(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_PAGES_PER_SITE):
+def crawl_domain(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, max_pages=MAX_PAGES_PER_SITE):
     """
-    Perform a shallow BFS crawl starting from 'start_url'.
-    Return a list of dicts with keys: 'url', 'snippet', 'year_range'.
+    Crawl a single domain using a shallow BFS. Only follow links that appear 
+    relevant based on link text or URL. Return a list of results, each a dict:
+    { 'url': str, 'snippet': str, 'year_range': str }.
     """
     results = []
     visited = set()
-    queue = deque([(start_url, 0)])
+    queue = deque([(normalize_url(start_url), 0)])
     
-    # Normalize the start_url
-    if not start_url.startswith("http"):
-        start_url = "http://" + start_url
-
-    # Get disallowed paths from robots.txt
-    disallowed_paths = get_robots_txt_disallows(start_url)
-
     pages_crawled = 0
 
     while queue:
         current_url, depth = queue.popleft()
+
         if current_url in visited or depth > max_depth:
             continue
-
         visited.add(current_url)
+
         pages_crawled += 1
         if pages_crawled > max_pages:
-            break  # Avoid crawling too many pages on one domain
-
-        # Check robots.txt
-        parsed_current = urlparse(current_url)
-        url_path = parsed_current.path or "/"
-        if not is_allowed_by_robots(disallowed_paths, url_path):
-            continue
+            break  # Avoid crawling too many pages
 
         # Fetch the page
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
-            resp = requests.get(current_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+            resp = requests.get(
+                current_url, 
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                headers={"User-Agent": USER_AGENT}
+            )
             if resp.status_code != 200:
                 continue
 
-            # Only parse if it's HTML
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" not in content_type.lower():
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "text/html" not in content_type:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
             text = soup.get_text(separator=" ", strip=True)
 
-            # Check if keyword is in the page text
+            # Check if the page has our KEYWORD
             if keyword.lower() in text.lower():
                 snippet = extract_snippet(text, keyword)
                 year_range = extract_year_range(snippet or text)
@@ -1035,39 +1033,52 @@ def shallow_crawl_for_keyword(start_url, keyword=KEYWORD, max_depth=MAX_DEPTH, m
                     "year_range": year_range
                 })
 
-            # BFS: gather links if within depth
+            # If we haven't reached max_depth, find relevant links
             if depth < max_depth:
                 for link in soup.find_all("a", href=True):
+                    link_text = link.get_text(separator=" ", strip=True)
                     href = link["href"]
-                    next_url = urljoin(current_url, href)
-                    # Only follow links on the same domain
-                    if same_domain(start_url, next_url) and next_url not in visited:
+                    next_url = normalize_url(urljoin(current_url, href))
+                    # Only enqueue if same domain + relevant link
+                    if same_domain(current_url, next_url) and link_is_relevant(link_text, next_url):
                         queue.append((next_url, depth + 1))
 
         except requests.RequestException:
-            # Handle timeouts, connection issues, etc.
+            # If we fail (timeout, etc.), skip
             continue
 
     return results
 
+################################################################################
+# PARALLEL DRIVER
+################################################################################
+
 def main():
     all_results = []
 
-    for college_url in COMMUNITY_COLLEGE_URLS:
-        print(f"\n=== Crawling {college_url} ===")
-        site_results = shallow_crawl_for_keyword(college_url)
-        print(f"Found {len(site_results)} pages referencing '{KEYWORD}' at {college_url}")
-        all_results.extend(site_results)
+    # We'll run each domain in parallel using a ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_domain = {
+            executor.submit(crawl_domain, url): url
+            for url in COMMUNITY_COLLEGE_URLS
+        }
+        for future in concurrent.futures.as_completed(future_to_domain):
+            domain_url = future_to_domain[future]
+            try:
+                domain_results = future.result()
+                print(f"[INFO] {domain_url} => {len(domain_results)} matches")
+                all_results.extend(domain_results)
+            except Exception as e:
+                print(f"[ERROR] {domain_url} => {e}")
 
-    # Convert to DataFrame
+    # Convert to DataFrame and save
     df = pd.DataFrame(all_results)
     if not df.empty:
-        print("\nSummary of All Findings (first 10 rows):")
-        print(df.head(10))
+        df.drop_duplicates(subset=["url"], inplace=True)
         df.to_csv("strategic_plan_results.csv", index=False)
-        print("\nResults saved to strategic_plan_results.csv")
+        print(f"\n[INFO] Results saved to strategic_plan_results.csv ({len(df)} rows)")
     else:
-        print("\nNo results found for any site.")
+        print("\n[INFO] No results found for any site.")
 
 if __name__ == "__main__":
     main()
